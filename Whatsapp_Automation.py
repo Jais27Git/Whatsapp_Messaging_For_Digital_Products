@@ -105,7 +105,7 @@ WA_HEADERS = {
 }
 
 # Delay between each WhatsApp API call (seconds) to avoid rate limits
-SEND_DELAY_SECONDS = 0.5
+SEND_DELAY_SECONDS = 2
 
 # =============================================================
 # DISCOVERY TEMPLATE CONFIG
