@@ -2,8 +2,8 @@ name: Voucher Sync
 
 on:
   schedule:
-    # Every 30 minutes
-    - cron: "*/30 * * * *"
+    # Every 20 minutes
+    - cron: "*/20 * * * *"
 
   workflow_dispatch:
 
