@@ -85,7 +85,7 @@ from tabulate import tabulate
 
 METABASE_URL = os.environ["METABASE_URL"]
 METABASE_API_KEY = os.environ["METABASE_API_KEY"]
-CARD_ID = int(os.environ["METABASE_CARD_ID"])
+CARD_ID = int(os.environ["CARD_ID"])
 
 # =============================================================
 # WHATSAPP CLOUD API CONFIG
@@ -128,7 +128,7 @@ HEALTHIFY_IMAGE_ID      = "1558213535959134"
 # GOOGLE SERVICE ACCOUNT
 # =============================================================
 
-SERVICE_ACCOUNT_INFO = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT"])
+SERVICE_ACCOUNT_INFO = json.loads(os.environ["SERVICE_ACCOUNT_INFO"])
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
 WORKSHEET_NAME = os.environ.get("WORKSHEET_NAME", "Sheet1")
 
