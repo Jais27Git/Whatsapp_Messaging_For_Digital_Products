@@ -37,4 +37,4 @@ jobs:
           SERVICE_ACCOUNT_INFO: ${{ secrets.SERVICE_ACCOUNT_INFO }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
 
-        run: Whatsapp_Automation.py
+        run: python Whatsapp_Automation.py
