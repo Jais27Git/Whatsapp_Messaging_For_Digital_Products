@@ -6,7 +6,9 @@ Author       : Ankit Kumar
 Company      : Daalchini Technologies Pvt. Ltd.
 Created On   : 2026-06-26
 Python       : 3.11+
-Version      : 2.5.1 (GitHub Actions Ready)
+Version      : 2.6.0 (GitHub Actions Ready)
+Changelog    : 2.6.0 - Added Paytm provider (uses kredmint_voucher template
+                       with product name "Paytm Voucher")
 ===============================================================================
 """
 import os
@@ -74,9 +76,11 @@ DISCOVERY_IMAGE_URL     = (
     "https://firebasestorage.googleapis.com/v0/b/daalchini-variant-portal.firebasestorage.app/o/Campaign%20Images%2FAnnual%20Plan.png?alt=media&token=847ee36e-7e9a-4053-8ddf-cd961ec098be"
 )
 
+# kredmint_voucher template is shared by Kredmint AND Paytm providers
 KREDMINT_TEMPLATE_NAME = "kredmint_voucher"
 KREDMINT_LANGUAGE_CODE = "en"
 KREDMINT_PRODUCT_NAME  = "Kredmint Voucher"
+PAYTM_PRODUCT_NAME     = "Paytm Voucher"
 
 HEALTHIFY_TEMPLATE_NAME = "healthify_msg"
 HEALTHIFY_IMAGE_ID      = "1558213535959134"
@@ -85,6 +89,7 @@ HEALTHIFY_IMAGE_ID      = "1558213535959134"
 PROVIDER_TEMPLATE_MAP = {
     "discovery": "Discovery",
     "kredmint":  "Kredmint",
+    "paytm":     "Paytm",
     "healthify": "Healthify",
 }
 
@@ -217,7 +222,8 @@ def build_discovery_payload(phone: str, order_id: str, coupon_code: str) -> dict
     }
 
 
-def build_kredmint_payload(phone: str, order_id: str, coupon_code: str) -> dict:
+def build_kredmint_payload(phone: str, order_id: str, coupon_code: str,
+                           product_name: str = KREDMINT_PRODUCT_NAME) -> dict:
     return {
         "messaging_product": "whatsapp",
         "to": phone,
@@ -229,7 +235,7 @@ def build_kredmint_payload(phone: str, order_id: str, coupon_code: str) -> dict:
                 {
                     "type": "body",
                     "parameters": [
-                        {"type": "text", "parameter_name": "product_name", "text": KREDMINT_PRODUCT_NAME},
+                        {"type": "text", "parameter_name": "product_name", "text": product_name},
                         {"type": "text", "parameter_name": "voucher_code", "text": coupon_code},
                     ],
                 },
@@ -242,6 +248,11 @@ def build_kredmint_payload(phone: str, order_id: str, coupon_code: str) -> dict:
             ],
         },
     }
+
+
+def build_paytm_payload(phone: str, order_id: str, coupon_code: str) -> dict:
+    # Same kredmint_voucher template, but product name = "Paytm Voucher"
+    return build_kredmint_payload(phone, order_id, coupon_code, product_name=PAYTM_PRODUCT_NAME)
 
 
 def build_healthify_payload(phone: str, order_id: str, coupon_code: str) -> dict:
@@ -278,6 +289,7 @@ def build_healthify_payload(phone: str, order_id: str, coupon_code: str) -> dict
 TEMPLATE_BUILDERS = {
     "discovery": build_discovery_payload,
     "kredmint":  build_kredmint_payload,
+    "paytm":     build_paytm_payload,
     "healthify": build_healthify_payload,
 }
 
