@@ -6,9 +6,15 @@ Author       : Ankit Kumar
 Company      : Daalchini Technologies Pvt. Ltd.
 Created On   : 2026-06-26
 Python       : 3.11+
-Version      : 2.6.0 (GitHub Actions Ready)
+Version      : 2.7.0 (GitHub Actions Ready)
 Changelog    : 2.6.0 - Added Paytm provider (uses kredmint_voucher template
                        with product name "Paytm Voucher")
+               2.7.0 - Fixed Google Sheets 429 quota errors:
+                       * one F:J write per row instead of 3 separate writes
+                       * buffered batch_update (flush every N sends)
+                       * retry with backoff on 429 / 5xx
+                       * skip rewriting rows whose values haven't changed
+                       * flush buffered updates even if the run crashes
 ===============================================================================
 """
 import os
@@ -44,6 +50,12 @@ WORKSHEET_NAME = os.environ.get("WORKSHEET_NAME", "Sheet1")
 SERVICE_ACCOUNT_INFO_RAW = os.environ.get("SERVICE_ACCOUNT_INFO", "")
 
 SEND_DELAY_SECONDS = 2
+
+# Google Sheets write throttling (limit: 60 write requests / minute / user)
+SENT_FLUSH_EVERY      = 10    # save to sheet after every N WhatsApp send attempts
+MAX_BUFFERED_UPDATES  = 500   # also save if this many row updates are queued
+SHEETS_MAX_RETRIES    = 6     # attempts per Sheets API call on 429 / 5xx
+SHEETS_RETRYABLE_CODES = (429, 500, 502, 503)
 
 # Verify essential secrets before running
 if not METABASE_API_KEY:
@@ -187,6 +199,59 @@ def resolve_template(provider: str) -> str:
 
 
 # =============================================================
+# GOOGLE SHEETS: RETRY + BUFFERED WRITES
+# =============================================================
+
+def sheets_call(fn, *args, **kwargs):
+    """Call a gspread function, retrying with backoff on quota / server errors."""
+    for attempt in range(1, SHEETS_MAX_RETRIES + 1):
+        try:
+            return fn(*args, **kwargs)
+        except gspread.exceptions.APIError as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status not in SHEETS_RETRYABLE_CODES or attempt == SHEETS_MAX_RETRIES:
+                raise
+            wait = min(10 * 2 ** (attempt - 1), 65)
+            print(f"  ⏳ Google Sheets API error {status} — retry {attempt}/{SHEETS_MAX_RETRIES - 1} in {wait}s")
+            time.sleep(wait)
+
+
+class SheetUpdateBuffer:
+    """Collects F:J row updates and writes them in a single batch_update call."""
+
+    def __init__(self, sheet):
+        self.sheet = sheet
+        self.updates = []
+        self.sends_since_flush = 0
+        self.total_written = 0
+
+    def add(self, row_num: int, current_row: list, values: list, is_send: bool = False) -> None:
+        # Skip writing if F:J already holds exactly these values
+        current = [
+            (current_row[i].strip() if len(current_row) > i else "")
+            for i in range(COL_STATUS, COL_ERROR + 1)
+        ]
+        if not is_send and current == values:
+            return
+
+        self.updates.append({"range": f"F{row_num}:J{row_num}", "values": [values]})
+        if is_send:
+            self.sends_since_flush += 1
+
+        if self.sends_since_flush >= SENT_FLUSH_EVERY or len(self.updates) >= MAX_BUFFERED_UPDATES:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self.updates:
+            return
+        sheets_call(self.sheet.batch_update, self.updates)
+        self.total_written += len(self.updates)
+        print(f"  💾 Saved {len(self.updates)} row update(s) to sheet")
+        self.updates = []
+        self.sends_since_flush = 0
+
+
+# =============================================================
 # PAYLOAD BUILDERS
 # =============================================================
 
@@ -308,6 +373,9 @@ def send_whatsapp(payload: dict) -> tuple[bool, str, str]:
         return False, "", error_msg[:200]
     except requests.exceptions.RequestException as e:
         return False, "", str(e)[:200]
+    except ValueError as e:
+        # Non-JSON response from WhatsApp API
+        return False, "", f"Invalid response from WhatsApp API: {e}"[:200]
 
 
 # =============================================================
@@ -338,16 +406,16 @@ def main():
     ]
     credentials = Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO, scopes=scopes)
     gc = gspread.authorize(credentials)
-    sheet = gc.open_by_key(SPREADSHEET_ID).worksheet(WORKSHEET_NAME)
+    sheet = sheets_call(lambda: gc.open_by_key(SPREADSHEET_ID).worksheet(WORKSHEET_NAME))
 
-    existing = sheet.get_all_values()
+    existing = sheets_call(sheet.get_all_values)
     existing = [row for row in existing if any(cell.strip() for cell in row)]
 
     if not existing:
-        sheet.insert_row(SHEET_HEADERS, 1)
+        sheets_call(sheet.insert_row, SHEET_HEADERS, 1)
         existing = [SHEET_HEADERS]
     elif existing[0] != SHEET_HEADERS:
-        sheet.insert_row(SHEET_HEADERS, 1)
+        sheets_call(sheet.insert_row, SHEET_HEADERS, 1)
         existing = [SHEET_HEADERS] + existing
 
     # ---------------------------------------------------------
@@ -404,7 +472,7 @@ def main():
         print("  (no new records to add)")
 
     if rows_to_insert:
-        sheet.append_rows(rows_to_insert)
+        sheets_call(sheet.append_rows, rows_to_insert)
         print(f"\n  ✅ Added {len(rows_to_insert)} new rows to sheet.")
     else:
         print(f"\n  ✅ No new rows to add.")
@@ -429,7 +497,7 @@ def main():
 
     print(f"  Provider records available from Metabase : {len(metabase_provider_lookup)}")
 
-    all_rows = sheet.get_all_values()
+    all_rows = sheets_call(sheet.get_all_values)
     data_rows = all_rows[1:]
 
     pending = [
@@ -442,79 +510,86 @@ def main():
     print(f"  PENDING / FAILED rows to evaluate : {len(pending)}\n")
 
     send_summary = []
+    buffer = SheetUpdateBuffer(sheet)
 
-    for sheet_row_num, row in pending:
-        raw_phone    = row[COL_MOBILE].strip()    if len(row) > COL_MOBILE   else ""
-        order_id     = row[COL_ORDER_ID].strip()  if len(row) > COL_ORDER_ID else ""
-        coupon_code  = row[COL_CODE].strip()      if len(row) > COL_CODE     else ""
-        old_template = row[COL_TEMPLATE].strip() if len(row) > COL_TEMPLATE else ""
+    try:
+        for sheet_row_num, row in pending:
+            raw_phone    = row[COL_MOBILE].strip()    if len(row) > COL_MOBILE   else ""
+            order_id     = row[COL_ORDER_ID].strip()  if len(row) > COL_ORDER_ID else ""
+            coupon_code  = row[COL_CODE].strip()      if len(row) > COL_CODE     else ""
+            old_template = row[COL_TEMPLATE].strip()  if len(row) > COL_TEMPLATE else ""
 
-        phone = format_phone(raw_phone)
+            phone = format_phone(raw_phone)
 
-        # Lookup from Metabase
-        provider = metabase_provider_lookup.get(f"{raw_phone}|{order_id}")
-        if provider is None:
-            normalized_sheet_phone = format_phone(raw_phone)
-            for mb_key, mb_provider in metabase_provider_lookup.items():
-                mb_phone, mb_order = mb_key.split("|", 1)
-                if format_phone(mb_phone) == normalized_sheet_phone and mb_order == order_id:
-                    provider = mb_provider
-                    break
+            # Lookup from Metabase
+            provider = metabase_provider_lookup.get(f"{raw_phone}|{order_id}")
+            if provider is None:
+                normalized_sheet_phone = format_phone(raw_phone)
+                for mb_key, mb_provider in metabase_provider_lookup.items():
+                    mb_phone, mb_order = mb_key.split("|", 1)
+                    if format_phone(mb_phone) == normalized_sheet_phone and mb_order == order_id:
+                        provider = mb_provider
+                        break
 
-        provider_clean = str(provider).strip() if provider is not None else ""
+            provider_clean = str(provider).strip() if provider is not None else ""
 
-        # RULE 1: Missing Provider -> NO SEND, NO FALLBACK
-        if not provider_clean or provider_clean.lower() in ("none", "null", "nan"):
-            error_msg = "Skipped: Missing/empty provider in Metabase (no fallback)"
-            print(f"  Row {sheet_row_num} → ❌ SKIPPED — {error_msg}")
+            # RULE 1: Missing Provider -> NO SEND, NO FALLBACK
+            if not provider_clean or provider_clean.lower() in ("none", "null", "nan"):
+                error_msg = "Skipped: Missing/empty provider in Metabase (no fallback)"
+                print(f"  Row {sheet_row_num} → ❌ SKIPPED — {error_msg}")
 
-            sheet.update(range_name=f"F{sheet_row_num}", values=[["FAILED"]])
-            sheet.update(range_name=f"H{sheet_row_num}:J{sheet_row_num}", values=[["", "", error_msg]])
+                # F:J → Status, Template (unchanged), Sent At, Message ID, Error
+                buffer.add(sheet_row_num, row, ["FAILED", old_template, "", "", error_msg])
 
-            send_summary.append([sheet_row_num, phone, order_id, coupon_code, old_template or "Unknown", "FAILED", "-", error_msg])
-            continue
+                send_summary.append([sheet_row_num, phone, order_id, coupon_code, old_template or "Unknown", "FAILED", "-", error_msg])
+                continue
 
-        # RULE 2: Unknown Provider -> NO SEND, NO FALLBACK
-        template = resolve_template(provider_clean)
-        if template == "Unknown" or template.lower() not in TEMPLATE_BUILDERS:
-            error_msg = f"Skipped: Unknown provider '{provider_clean}' (no fallback)"
-            print(f"  Row {sheet_row_num} → Provider='{provider_clean}' → ❌ SKIPPED — {error_msg}")
+            # RULE 2: Unknown Provider -> NO SEND, NO FALLBACK
+            template = resolve_template(provider_clean)
+            if template == "Unknown" or template.lower() not in TEMPLATE_BUILDERS:
+                error_msg = f"Skipped: Unknown provider '{provider_clean}' (no fallback)"
+                print(f"  Row {sheet_row_num} → Provider='{provider_clean}' → ❌ SKIPPED — {error_msg}")
 
-            if old_template != "Unknown":
-                sheet.update(range_name=f"G{sheet_row_num}", values=[["Unknown"]])
+                buffer.add(sheet_row_num, row, ["FAILED", "Unknown", "", "", error_msg])
 
-            sheet.update(range_name=f"F{sheet_row_num}", values=[["FAILED"]])
-            sheet.update(range_name=f"H{sheet_row_num}:J{sheet_row_num}", values=[["", "", error_msg]])
+                send_summary.append([sheet_row_num, phone, order_id, coupon_code, "Unknown", "FAILED", "-", error_msg])
+                continue
 
-            send_summary.append([sheet_row_num, phone, order_id, coupon_code, "Unknown", "FAILED", "-", error_msg])
-            continue
+            # Valid provider found
+            print(f"  Row {sheet_row_num} → Provider='{provider_clean}' → Template='{template}'")
+            if template != old_template:
+                print(f"             Template updated: '{old_template}' → '{template}'")
 
-        # Valid provider found: update col G if template changed
-        print(f"  Row {sheet_row_num} → Provider='{provider_clean}' → Template='{template}'")
-        if template != old_template:
-            sheet.update(range_name=f"G{sheet_row_num}", values=[[template]])
-            print(f"             Template updated: '{old_template}' → '{template}'")
+            # Send WhatsApp
+            builder = TEMPLATE_BUILDERS[template.lower()]
+            payload = builder(phone, order_id, coupon_code)
+            success, message_id, error = send_whatsapp(payload)
 
-        # Send WhatsApp
-        builder = TEMPLATE_BUILDERS[template.lower()]
-        payload = builder(phone, order_id, coupon_code)
-        success, message_id, error = send_whatsapp(payload)
+            if success:
+                sent_at = now_str()
+                buffer.add(sheet_row_num, row, ["SENT", template, sent_at, message_id, ""], is_send=True)
 
-        if success:
-            sent_at = now_str()
-            sheet.update(range_name=f"F{sheet_row_num}", values=[["SENT"]])
-            sheet.update(range_name=f"H{sheet_row_num}:J{sheet_row_num}", values=[[sent_at, message_id, ""]])
+                send_summary.append([sheet_row_num, phone, order_id, coupon_code, template, "SENT", sent_at, message_id])
+                print(f"  Row {sheet_row_num} → ✅ SENT  {phone}  {template}  {coupon_code}  {message_id}")
+            else:
+                buffer.add(sheet_row_num, row, ["FAILED", template, "", "", error], is_send=True)
 
-            send_summary.append([sheet_row_num, phone, order_id, coupon_code, template, "SENT", sent_at, message_id])
-            print(f"  Row {sheet_row_num} → ✅ SENT  {phone}  {template}  {coupon_code}  {message_id}")
-        else:
-            sheet.update(range_name=f"F{sheet_row_num}", values=[["FAILED"]])
-            sheet.update(range_name=f"H{sheet_row_num}:J{sheet_row_num}", values=[["", "", error]])
+                send_summary.append([sheet_row_num, phone, order_id, coupon_code, template, "FAILED", "-", error])
+                print(f"  Row {sheet_row_num} → ❌ FAILED  {phone}  {template}  {coupon_code}  {error}")
 
-            send_summary.append([sheet_row_num, phone, order_id, coupon_code, template, "FAILED", "-", error])
-            print(f"  Row {sheet_row_num} → ❌ FAILED  {phone}  {template}  {coupon_code}  {error}")
+            time.sleep(SEND_DELAY_SECONDS)
 
-        time.sleep(SEND_DELAY_SECONDS)
+    finally:
+        # Always save buffered updates — protects SENT rows from being re-sent next run
+        try:
+            buffer.flush()
+        except Exception as e:
+            print("\n  🚨 CRITICAL: Could not save these row updates to the sheet.")
+            print("     Update them manually to avoid duplicate WhatsApp messages on the next run:")
+            for u in buffer.updates:
+                print(f"     {u['range']} → {u['values'][0]}")
+            print(f"     Error: {e}")
+            raise
 
     # ---------------------------------------------------------
     # SUMMARY
@@ -536,6 +611,7 @@ def main():
   New rows added to sheet   : {len(rows_to_insert)}
   WhatsApp messages sent    : {sent_count}
   WhatsApp messages failed  : {failed_count}
+  Sheet row updates written : {buffer.total_written}
 """)
 
 if __name__ == "__main__":
